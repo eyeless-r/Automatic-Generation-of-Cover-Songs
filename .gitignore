@@ -8,3 +8,7 @@ samples
 pretrained/*
 *.pt
 code_perso
+index.md
+lmdb/
+slakh2100_flac_redux/
+diffusion/runs/

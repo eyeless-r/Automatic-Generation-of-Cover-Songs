@@ -1,6 +1,6 @@
 #EDM Diffusion was adapted from the official implementation https://github.com/NVlabs/edm
 
-from typing import Callable, Optional
+from typing import Callable, Optional, List
 import numpy as np
 import torch
 from torch import nn
@@ -12,6 +12,7 @@ import numpy as np
 import gin
 from torch_ema import ExponentialMovingAverage
 import os
+import copy
 
 
 @gin.configurable
@@ -204,7 +205,7 @@ class Base(nn.Module):
                                     map_location="cpu")
 
             self.load_state_dict(state_dict["model_state"], strict=False)
-            self.opt.load_state_dict(state_dict["opt_state"])
+            # self.opt.load_state_dict(state_dict["opt_state"])
             self.step = restart_step + 1
 
             print("Restarting from step ", self.step)
@@ -217,18 +218,19 @@ class Base(nn.Module):
                 params += list(self.encoder.parameters())
             ema = ExponentialMovingAverage(params, decay=0.999)
 
+        n_epochs = max_steps // len(dataloader) + 1
+
         if self.accelerator.is_main_process:
             logger = SummaryWriter(log_dir=model_dir + "/logs")
-            self.tepoch = tqdm(total=max_steps, unit="batch")
+            self.tepoch = tqdm(total=n_epochs * len(dataloader), unit="batch")
 
         self.accelerator.wait_for_everyone()
 
-        n_epochs = max_steps // len(dataloader) + 1
         losses_sum = {}
         losses_sum_count = {}
 
-        with open(os.path.join(model_dir, "config.gin"), "w") as config_out:
-            config_out.write(gin.operative_config_str())
+        # with open(os.path.join(model_dir, "config.gin"), "w") as config_out:
+        #     config_out.write(gin.operative_config_str())
 
         for e in range(n_epochs):
             for batch in dataloader:
@@ -839,3 +841,608 @@ class EDM_ADV(EDM):
                 "Classifier loss": classifier_loss.item(),
                 "Regularisation weight": reg_classifier
             }
+        
+@gin.configurable
+class EDM_ADV_SS(EDM):
+
+    def __init__(
+        self,
+        *,
+        n_stems: int = 4,
+        reg_classifier: float,
+        warmup_classifier: int,
+        warmup_timbre: int,
+        sigma_min: float = 0.002,
+        sigma_max: float = 80.,
+        p_mean: float = -1.2,
+        p_std: float = 1.2,
+        rho: float = 7,
+        sdata: float,
+        **basekwargs,
+    ):
+        super().__init__(**basekwargs)
+        self.reg_classifier = reg_classifier
+        self.warmup_classifier = warmup_classifier
+        self.warmup_timbre = warmup_timbre
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.p_mean = p_mean
+        self.p_std = p_std
+        self.rho = rho
+        self.sdata = sdata
+        self.n_stems = n_stems
+
+        self.encoders = torch.nn.ModuleList([copy.deepcopy(self.encoder) for _ in range(n_stems)])
+        del self.encoder
+        self.encoders_time = torch.nn.ModuleList([copy.deepcopy(self.encoder_time) for _ in range(n_stems)])
+        del self.encoder_time
+        self.classifiers = torch.nn.ModuleList([copy.deepcopy(self.classifier) for _ in range(n_stems)])
+        del self.classifier
+        
+        return
+
+    @gin.configurable
+    def init_train_ss(self, dataloader, lr):
+        params = list(self.net.parameters())
+        if self.encoders is not None and self.train_encoder == True:
+            for encoder in self.encoders:
+                params += list(encoder.parameters())
+        if self.encoders_time is not None and self.train_encoder_time == True:
+            for encoder_time in self.encoders_time:
+                params += list(encoder_time.parameters())
+
+        self.opt = AdamW(params, lr=lr, betas=(0.9, 0.999))
+        self.scheduler = self.get_scheduler(self.opt)
+        self.step = 0
+
+        if self.classifiers[0] is not None:
+            self.opt_classifier = AdamW(self.classifier.parameters(),
+                                        lr=lr,
+                                        betas=(0.9, 0.999))
+        else:
+            self.opt_classifier = None
+
+        self.opt, self.opt_classifier, self.scheduler, dataloader = self.accelerator.prepare(
+            self.opt, self.opt_classifier, self.scheduler, dataloader)
+
+        print("init done")
+        return dataloader
+
+    @torch.no_grad()
+    def prep_data(self, batch, device=None):
+
+        x1 = batch["x"].to(device)
+        x1_tozs = batch["x_toz"]
+        x1_time_conds = batch["x_time_cond"]
+
+        if self.time_transform is not None:
+            time_conds = [self.time_transform(x1_time_cond.to(device)) for x1_time_cond in x1_time_conds]
+        else:
+            time_conds = [x1_time_cond.to(device) for x1_time_cond in x1_time_conds]
+
+        if x1_tozs[0].shape[1] == 1:
+            x1 = self.emb_model.encode(x1)
+            x1_toz = [self.emb_model.encode(x1_toz.to(device)) for x1_toz in x1_tozs]
+
+        if x1.shape[-1] != time_conds[0].shape[-1]:
+            time_conds = [torch.nn.functional.interpolate(time_cond,
+                                                        size=(x1.shape[-1]),
+                                                        mode="nearest") for time_cond in time_conds]
+
+        return x1, x1_toz, time_conds, None, None
+
+    @gin.configurable
+    def fit_ss(self,
+            dataset,
+            dataloader,
+            restart_step,
+            model_dir,
+            max_steps,
+            steps_valid=5000,
+            steps_display=100,
+            steps_save=25000,
+            guidance=0.15,
+            validloader=None,
+            train_encoder=True,
+            train_encoder_time=True,
+            use_ema=True,
+            device="cpu",
+            use_context=True,
+            initialized=False):
+
+        self.train_encoder = train_encoder
+        self.train_encoder_time = train_encoder_time
+        self.use_ema = use_ema
+
+        dataloader = self.init_train_ss(dataloader=dataloader)
+
+        if restart_step > 0:
+            if not initialized:
+                state_dict = torch.load(f"{model_dir}/checkpoint" +
+                                        str(restart_step) + ".pt",
+                                        map_location="cpu")
+
+                self.load_state_dict(state_dict["model_state"], strict=False)
+                # self.opt.load_state_dict(state_dict["opt_state"])
+            self.step = restart_step + 1
+
+            print("Restarting from step ", self.step)
+
+        if self.use_ema:
+            params = list(self.net.parameters())
+            for encoder_time in self.encoders_time:
+                params += list(encoder_time.parameters())
+            for encoder in self.encoders:
+                params += list(encoder.parameters())
+            ema = ExponentialMovingAverage(params, decay=0.999)
+
+        n_epochs = max_steps // len(dataloader) + 1
+
+        if self.accelerator.is_main_process:
+            logger = SummaryWriter(log_dir=model_dir + "/logs")
+            self.tepoch = tqdm(total=n_epochs * len(dataloader), unit="batch")
+
+        self.accelerator.wait_for_everyone()
+
+        losses_sum = {}
+        losses_sum_count = {}
+
+        # with open(os.path.join(model_dir, "config.gin"), "w") as config_out:
+        #     config_out.write(gin.operative_config_str())
+
+        for e in range(n_epochs):
+            for batch in dataloader:
+                x1, x1_toz, time_cond, _, _ = self.prep_data(batch, device=device)
+
+                if x1_toz is not None:
+                    if self.encoders is not None:
+                        if self.train_encoder:
+                            zsem = [self.encoders[i](x1_toz[i]) for i in range(self.n_stems)]
+                        else:
+                            with torch.no_grad():
+                                zsem = [self.encoders[i](x1_toz[i]) for i in range(self.n_stems)]
+                    else:
+                        zsem = x1_toz
+                else:
+                    zsem = None
+
+                if self.encoders_time is not None:
+                    if self.train_encoder_time:
+                        time_cond = [self.encoders_time[i](time_cond[i]) for i in range(self.n_stems)]
+                    else:
+                        with torch.no_grad():
+                            time_cond = [self.encoders_time[i](time_cond[i]) for i in range(self.n_stems)]
+                else:
+                    time_cond = time_cond
+
+                if guidance > 0:
+                    time_cond_drop = self.cfgdrop(time_cond, guidance,
+                                                  [self.time_cond_drop] * len(time_cond))
+                else:
+                    time_cond_drop = time_cond
+
+                time_cond_full = time_cond_drop
+
+                lossdict = self.training_step(x1,
+                                              time_cond=time_cond_full,
+                                              zsem=zsem,
+                                              time_cond_true=time_cond,
+                                              zsem_true=zsem)
+                #context = time_cond_add if use_context == True else None)
+
+
+                if self.use_ema:
+                    ema.update()
+
+                lossdict["current_lr"] = self.scheduler.get_last_lr()[0]
+
+                for k in lossdict:
+                    losses_sum[k] = losses_sum.get(k, 0.) + lossdict[k]
+                    losses_sum_count[k] = losses_sum_count.get(k, 0) + 1
+
+                if self.step % steps_display == 0 and self.accelerator.is_main_process:
+                    self.tepoch.set_postfix(loss=losses_sum["Diffusion loss"] /
+                                            steps_display)
+                    for k in losses_sum:
+                        logger.add_scalar('Loss/' + k,
+                                          losses_sum[k] /
+                                          max(1, losses_sum_count[k]),
+                                          global_step=self.step)
+                        losses_sum[k] = 0.
+                        losses_sum_count[k] = 0
+
+                if self.step % steps_valid == 0 and self.step > 0:
+                    with torch.no_grad():
+                        if self.accelerator.is_main_process:
+                            self.accelerator.print("Validation")
+                            ## Validation
+                            lossval = {}
+                            for i, batch in enumerate(validloader):
+                                x1, x1_toz, time_cond, _, _ = self.prep_data(
+                                    batch, device=self.device)
+
+                                if x1_toz is not None:
+                                    if self.encoders is not None:
+                                        zsem = [self.encoders[i](x1_toz[i]) for i in range(self.n_stems)]
+                                    else:
+                                        zsem = x1_toz
+                                else:
+                                    zsem = None
+
+                                if self.encoders_time is not None:
+                                    time_cond = [self.encoders_time[i](time_cond[i]) for i in range(self.n_stems)]
+                                else:
+                                    time_cond = time_cond
+
+                                #time_cond = time_cond[..., time_cond.shape[-1]//4:-time_cond.shape[-1]//4]
+
+
+                                lossdict = self.valid_step(x1,
+                                                           time_cond=time_cond,
+                                                           zsem=zsem)
+
+                                for k in lossdict:
+                                    lossval[k] = lossval.get(k,
+                                                             0.) + lossdict[k]
+
+                                if i == 100:
+                                    break
+
+                            for k in lossval:
+                                logger.add_scalar('Loss/valid/' + k,
+                                                  lossval[k] / 100,
+                                                  global_step=self.step)
+
+                            with ema.average_parameters():
+                                lossval = {}
+                                for i, batch in enumerate(validloader):
+                                    x1, x1_toz, time_cond, _, _ = self.prep_data(
+                                        batch, device=self.device)
+
+                                if x1_toz is not None:
+                                    if self.encoders is not None:
+                                        zsem = [self.encoders[i](x1_toz[i]) for i in range(self.n_stems)]
+                                    else:
+                                        zsem = x1_toz
+                                else:
+                                    zsem = None
+
+                                if self.encoders_time is not None:
+                                    time_cond = [self.encoders_time[i](time_cond[i]) for i in range(self.n_stems)]
+                                else:
+                                    time_cond = time_cond
+
+
+                                    lossdict = self.valid_step(x1, time_cond=time_cond, zsem=zsem)
+
+                                    for k in lossdict:
+                                        lossval[k] = lossval.get(k, 0.) + lossdict[k]
+
+                                    if i == 100:
+                                        break
+
+                                for k in lossval:
+                                    logger.add_scalar('Loss/valid_EMA/' + k,
+                                                      lossval[k] / 100,
+                                                      global_step=self.step)
+
+                            ## Data out
+
+                            x1 = x1[:6].to(self.device)
+                            time_cond = [time_cond_[:6] for time_cond_ in time_cond] if time_cond is not None else None
+                            zsem = [zsem_[:6] for zsem_ in zsem] if zsem is not None else None
+                            x0 = self.sample_prior(x1.shape)
+
+                            x1_rec = self.sample(x0,
+                                                 nb_step=40,
+                                                 time_cond=time_cond,
+                                                 zsem=zsem)
+
+                            audio_true = self.emb_model.decode(x1).cpu()
+                            audio_rec = self.emb_model.decode(x1_rec).cpu()
+
+                            audio = torch.cat(
+                                (audio_true,
+                                 torch.zeros(audio_true.shape[0], 1,
+                                             20000), audio_rec), -1)
+
+                            audio = audio.reshape(-1)
+
+                            logger.add_audio("audio",
+                                             audio.detach(),
+                                             global_step=self.step,
+                                             sample_rate=self.sr)
+
+                if self.step % steps_save == 0:
+                    self.accelerator.wait_for_everyone()
+                    self.save_model(model_dir,
+                                    ema=ema if self.use_ema else None)
+
+                if self.accelerator.is_main_process:
+                    self.tepoch.update(1)
+
+                self.step += 1
+
+    def training_step(self, x1: torch.Tensor,
+                      time_cond: Optional[List[torch.Tensor]],
+                      time_cond_true: Optional[List[torch.Tensor]],
+                      zsem: Optional[List[torch.Tensor]],
+                      zsem_true: Optional[List[torch.Tensor]]) -> torch.Tensor:
+
+        if self.warmup_classifier > 0:
+            reg_classifier = min(
+                self.reg_classifier * ((self.step - self.warmup_classifier) /
+                                       self.warmup_classifier), self.
+                reg_classifier) if self.step > self.warmup_classifier else 0.
+        else:
+            reg_classifier = self.reg_classifier
+
+        if self.step > self.warmup_classifier and self.step % 3 == 0 and self.classifiers[0] is not None:
+
+            classifier_losses = []
+            for i in range(self.n_stems):
+                classifier_losses.append(torch.nn.functional.mse_loss(self.classifiers[i](time_cond_true[i].detach()),
+                                                            zsem_true[i].detach(),
+                                                            reduction='mean'))
+            classifier_loss = torch.stack(classifier_losses).mean()
+            self.opt_classifier.zero_grad()
+            self._backward(classifier_loss)
+            self.opt_classifier.step()
+
+            return {
+                "Classifier loss": classifier_loss.item(),
+            }
+        else:
+            b, *_ = x1.shape
+            data_shape = (b, *([1] * (len(x1.shape) - 1)))
+            sigma = self._get_sigma(data_shape)
+            x_noisy = x1 + torch.randn_like(x1) * sigma
+
+            if self.step < self.warmup_timbre:
+                time_cond = self.time_cond_drop * torch.ones_like(time_cond)
+
+            if self.step < self.warmup_classifier or self.classifiers[0] is None:
+                classifier_loss = torch.tensor(0.)
+            else:
+                classifier_losses = []
+                for i in range(self.n_stems):
+                    classifier_losses.append(torch.nn.functional.mse_loss(self.classifiers[i](time_cond_true[i]),
+                                                                zsem_true[i].detach(),
+                                                                reduction='mean'))
+                classifier_loss = torch.stack(classifier_losses).mean()
+                
+            d = self._model_forward(x=x1,
+                                    noisy=x_noisy,
+                                    sigma=sigma,
+                                    time_cond=time_cond,
+                                    zsem=zsem)
+            weight = self._get_weight(sigma)
+            diffloss = weight * ((d - x1)**2)
+            diffloss = diffloss.mean()
+
+            loss = diffloss - reg_classifier * classifier_loss
+
+            self.opt.zero_grad()
+            self._backward(loss)
+            torch.nn.utils.clip_grad_norm_(self.parameters(),
+                                           1.0,
+                                           norm_type=2.0)
+            self.opt.step()
+            self.scheduler.step()
+
+            return {
+                "Diffusion loss": diffloss.item(),
+                "Classifier loss": classifier_loss.item(),
+                "Regularisation weight": reg_classifier
+            }
+
+    @torch.no_grad()
+    def valid_step(self, x1: torch.Tensor, time_cond: Optional[List[torch.Tensor]],
+                   zsem: Optional[List[torch.Tensor]]):
+        b, *_ = x1.shape
+        data_shape = (b, *([1] * (len(x1.shape) - 1)))
+        sigma = self._get_sigma(data_shape)
+        x_noisy = x1 + torch.randn_like(x1) * sigma
+
+        d = self._model_forward(x=x1,
+                                noisy=x_noisy,
+                                sigma=sigma,
+                                time_cond=time_cond,
+                                zsem=zsem)
+        weight = self._get_weight(sigma)
+        loss = weight * ((d - x1)**2)
+
+        loss = loss.mean()
+        return {"Diffusion loss": loss.item()}
+
+    def _model_forward(self,
+                       *,
+                       x: torch.Tensor,
+                       noisy: torch.Tensor,
+                       sigma: torch.Tensor,
+                       time_cond: Optional[List[torch.Tensor]],
+                       zsem: Optional[List[torch.Tensor]],
+                       guidance: float = 1) -> torch.Tensor:
+        return self._fwd(x=noisy,
+                         sigma=sigma,
+                         time_cond=time_cond,
+                         zsem=zsem,
+                         guidance=guidance)
+
+    def _fwd(self,
+             x: torch.Tensor,
+             sigma: torch.Tensor,
+             time_cond: Optional[List[torch.Tensor]] = None,
+             zsem: Optional[List[torch.Tensor]] = None,
+             guidance: float = 1,
+             guidance_type: str = "both"):
+
+        c_skip, c_out, c_in, c_noise = self._get_scalings(sigma)
+        f_xy = self.net(
+            c_in * x,
+            time=c_noise.reshape(-1),  #.squeeze(),
+            time_cond=time_cond,
+            zsem=zsem)
+
+        if guidance != 1:
+            # print("using guidance")
+            if guidance_type == "time_cond" or guidance_type == "both":
+                if time_cond is not None:
+                    time_cond = [self.time_cond_drop * torch.ones_like(time_cond_) for time_cond_ in time_cond]
+                else:
+                    time_cond = None
+
+            if guidance_type == "zsem" or guidance_type == "both":
+                if zsem is not None:
+                    zsem = [self.zsem_drop * torch.ones_like(zsem_) for zsem_ in zsem]
+                else:
+                    zsem = None
+
+            f_x = self.net(c_in * x,
+                           time=c_noise.reshape(-1),
+                           time_cond=time_cond,
+                           zsem=zsem)
+            f_xy = (f_x * (1 - guidance) + guidance * f_xy)
+
+        d = c_skip * x + c_out * f_xy
+        return d
+
+    @torch.no_grad()
+    def sample(self,
+               x0: Optional[torch.Tensor] = None,
+               nb_step=256,
+               time_cond: Optional[List[torch.Tensor]] = None,
+               zsem: Optional[List[torch.Tensor]] = None,
+               sigma_max=None,
+               sigma_min=None,
+               guidance=1,
+               guidance_type="both",
+               verbose=True,
+               special_fwd=None):
+        sigma_max = sigma_max if sigma_max is not None else self.sigma_max
+        sigma_min = sigma_min if sigma_min is not None else self.sigma_min
+
+        return self._heun_sample(
+            base=x0,
+            sigma_max=sigma_max,
+            sigma_min=sigma_min,
+            rho=self.rho,
+            fwd_fn=special_fwd if special_fwd is not None else self._fwd,
+            nb_step=nb_step,
+            time_cond=time_cond,
+            zsem=zsem,
+            guidance=guidance,
+            guidance_type=guidance_type,
+            verbose=verbose,
+        )
+
+    def _heun_sample(
+        self,
+        base: torch.Tensor,
+        time_cond,
+        zsem,
+        guidance,
+        guidance_type,
+        sigma_max: float,
+        sigma_min: float,
+        rho: float,
+        fwd_fn,
+        nb_step,
+        verbose: bool = False,
+    ):
+
+        S_churn = 0.
+        S_min = 0.0
+        S_max = float("inf")
+        S_noise = 1.0
+        """https://github.com/NVlabs/edm/blob/main/generate.py#L25"""
+        step_indices = torch.arange(nb_step,
+                                    dtype=torch.float32,
+                                    device=base.device)
+        t_steps = (sigma_max**(1 / rho) + step_indices / (nb_step - 1) *
+                   (sigma_min**(1 / rho) - sigma_max**(1 / rho)))**rho
+        t_steps = torch.cat(
+            [torch.as_tensor(t_steps),
+             torch.zeros_like(t_steps[:1])])  # t_N = 0
+
+        # Main sampling loop.
+        x_next = base * t_steps[0]
+        batch_size = x_next.shape[0]
+
+        if verbose == True:
+            pbar = tqdm(
+                list(enumerate(zip(t_steps[:-1], t_steps[1:]))),
+                unit="step",
+            )
+        else:
+
+            pbar = list(enumerate(zip(t_steps[:-1], t_steps[1:])))
+        for i, (t_cur, t_next) in pbar:  # 0, ..., N-1
+            x_cur = x_next
+
+            # Increase noise temporarily.
+            gamma = min(S_churn / nb_step,
+                        torch.sqrt(torch.tensor(2.)) -
+                        1) if S_min <= t_cur <= S_max else 0
+            t_hat = torch.as_tensor(t_cur + gamma * t_cur)
+            x_hat = x_cur + (
+                t_hat**2 - t_cur**2).sqrt() * S_noise * torch.randn_like(x_cur)
+
+            # Euler step.
+            #ndim = len(x_hat.shape)-1
+            _t_hat = t_hat.repeat(batch_size).view(
+                (batch_size, *(1 for _ in range(x_hat.ndim - 1))))
+
+            denoised = fwd_fn(x=x_hat,
+                              sigma=_t_hat,
+                              zsem=zsem,
+                              time_cond=time_cond,
+                              guidance=guidance,
+                              guidance_type=guidance_type)
+
+            d_cur = (x_hat - denoised) / t_hat
+            x_next = x_hat + (t_next - t_hat) * d_cur
+
+            # Apply 2nd order correction.
+            if i < nb_step - 1:
+                _t_next = t_next.repeat(batch_size).view(
+                    (batch_size, *(1 for _ in range(x_next.ndim - 1))))
+                denoised = fwd_fn(x=x_next,
+                                  sigma=_t_next,
+                                  zsem=zsem,
+                                  time_cond=time_cond,
+                                  guidance=guidance,
+                                  guidance_type=guidance_type)
+                d_prime = (x_next - denoised) / t_next
+                x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur +
+                                                     0.5 * d_prime)
+
+        return x_next
+    
+        
+    def load_weights(self, model_dir, restart_step):
+        checkpoint_path = f"{model_dir}/checkpoint{restart_step}.pt"
+        state_dict = torch.load(checkpoint_path, map_location="cpu")["model_state"]
+        encoder_weights = {}
+        encoder_time_weights = {}
+        classifier_weights = {}
+        net_weights = {}
+        for key, value in state_dict.items():
+            if key.startswith('encoder.'):
+                new_key = key.replace('encoder.', '', 1)
+                encoder_weights[new_key] = value
+            elif key.startswith('encoder_time.'):
+                new_key = key.replace('encoder_time.', '', 1)
+                encoder_time_weights[new_key] = value
+            elif key.startswith('classifier.'):
+                new_key = key.replace('classifier.', '', 1)
+                classifier_weights[new_key] = value  
+            elif key.startswith('net.'):
+                new_key = key.replace('net.', '', 1)
+                net_weights[new_key] = value
+        for i in range(self.n_stems):
+            self.encoders[i].load_state_dict(encoder_weights, strict=False)
+            self.encoders_time[i].load_state_dict(encoder_time_weights, strict=False)
+            if self.classifiers[i] is not None:
+                self.classifiers[i].load_state_dict(classifier_weights, strict=False)
+        self.net.load_weights(net_weights)
