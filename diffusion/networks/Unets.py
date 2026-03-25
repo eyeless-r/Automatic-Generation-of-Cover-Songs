@@ -22,7 +22,13 @@ class ConvBlock1D(nn.Module):
                  res=True):
         super().__init__()
         self.res = res
-        self.conv1 = nn.Conv1d(in_c + time_cond_channels,
+        if n_stems == 1:
+            self.conv1 = nn.Conv1d(in_c + time_cond_channels,
+                               out_c,
+                               kernel_size=kernel_size,
+                               padding="same")
+        else:
+            self.conv1 = nn.Conv1d(in_c + time_cond_channels * 6,
                                out_c,
                                kernel_size=kernel_size,
                                padding="same")
@@ -65,7 +71,8 @@ class ConvBlock1D(nn.Module):
             if self.n_stems == 1:
                 x = torch.cat([x, time_cond], axis=1)
             else:
-                x = torch.cat([x, torch.stack(time_cond).max(axis=0).values], axis=1)
+                for tc in time_cond:
+                    x = torch.cat([x, tc], axis=1)
 
         x = self.conv1(x)
         x = self.gn1(x)
@@ -128,7 +135,8 @@ class ConvBlock1D(nn.Module):
             elif key.startswith('to_out.'):
                 new_key = key.replace('to_out.', '', 1)
                 to_out_weights[new_key] = value
-        self.conv1.load_state_dict(conv1_weights)
+        if self.n_stems == 1:
+            self.conv1.load_state_dict(conv1_weights)
         self.gn1.load_state_dict(gn1_weights)
         self.conv2.load_state_dict(conv2_weights)
         self.gn2.load_state_dict(gn2_weights)

@@ -14,8 +14,14 @@ Fine-tuning the model requires two steps : processing the dataset, then fine-tun
 
 (after downloading Slakh2100  [here](http://www.slakh.com/)) :
 
+For train_diffusion.py:
 ```bash
-python dataset/split_to_lmdb.py --input_path slakh2100_flac_redux --output_path lmdb
+python dataset/split_to_lmdb.py --input_path slakh2100_flac_redux --output_path lmdb --emb_model_path autoencoder_checkpoints/AE_slakh.pt --slakh_only_tracks
+```
+
+For train_with_ss.py:
+```bash
+python dataset/split_to_lmdb.py --input_path slakh2100_flac_redux --output_path lmdb_ss --emb_model_path autoencoder_checkpoints/AE_slakh.pt --slakh_only_tracks True --source_separation True
 ```
 
 ### Diffusion model fine-tuning
@@ -23,12 +29,12 @@ The model training is configured with gin config files.
 
 To fine-tune model without sourse separation:
 ```bash
-python train_diffusion.py --name fine-tune --db_path lmdb --config diffusion/runs/fine-tune/config --emb_model_path diffusion/runs/AE_slakh.pt --dataset_type waveform --gpu 0 --restart 500000
+python train_diffusion.py --name fine-tune --db_path lmdb --config diffusion/runs/fine-tune/config --emb_model_path autoencoder_checkpoints/AE_slakh.pt --dataset_type waveform --gpu 0 --restart 500000
 ```
 
 To fine-tune model with sourse separation:
 ```bash
-python train_with_ss.py --name fine-tune --db_path lmdb --config diffusion/runs/fine-tune/config_ss --emb_model_path diffusion/runs/AE_slakh.pt --dataset_type waveform --gpu 0 --restart 500000
+python train_with_ss.py --name fine-tune --db_path lmdb_ss --config diffusion/runs/fine-tune/config_ss --emb_model_path autoencoder_checkpoints/AE_slakh.pt --dataset_type waveform --gpu 0 --restart 500000
 ```
 
 <!-- ## Inference and pretrained models

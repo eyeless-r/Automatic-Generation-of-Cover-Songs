@@ -848,10 +848,10 @@ class EDM_ADV_SS(EDM):
     def __init__(
         self,
         *,
-        n_stems: int = 4,
         reg_classifier: float,
         warmup_classifier: int,
         warmup_timbre: int,
+        n_stems: int = 4,
         sigma_min: float = 0.002,
         sigma_max: float = 80.,
         p_mean: float = -1.2,
@@ -895,8 +895,11 @@ class EDM_ADV_SS(EDM):
         self.scheduler = self.get_scheduler(self.opt)
         self.step = 0
 
-        if self.classifiers[0] is not None:
-            self.opt_classifier = AdamW(self.classifier.parameters(),
+        if self.classifiers is not None:
+            params = []
+            for classifier in self.classifiers:
+                params += list(classifier.parameters())
+            self.opt_classifier = AdamW(params,
                                         lr=lr,
                                         betas=(0.9, 0.999))
         else:
@@ -922,14 +925,16 @@ class EDM_ADV_SS(EDM):
 
         if x1_tozs[0].shape[1] == 1:
             x1 = self.emb_model.encode(x1)
-            x1_toz = [self.emb_model.encode(x1_toz.to(device)) for x1_toz in x1_tozs]
+            x1_tozs = [self.emb_model.encode(x1_toz.to(device)) for x1_toz in x1_tozs]
+        else:
+            x1_tozs = [x1_toz.to(device) for x1_toz in x1_tozs]
 
         if x1.shape[-1] != time_conds[0].shape[-1]:
             time_conds = [torch.nn.functional.interpolate(time_cond,
                                                         size=(x1.shape[-1]),
                                                         mode="nearest") for time_cond in time_conds]
 
-        return x1, x1_toz, time_conds, None, None
+        return x1, x1_tozs, time_conds, None, None
 
     @gin.configurable
     def fit_ss(self,
@@ -976,7 +981,9 @@ class EDM_ADV_SS(EDM):
                 params += list(encoder.parameters())
             ema = ExponentialMovingAverage(params, decay=0.999)
 
-        n_epochs = max_steps // len(dataloader) + 1
+        n_epochs = max_steps // len(dataloader)
+        if max_steps % len(dataloader) != 0:
+            n_epochs += 1
 
         if self.accelerator.is_main_process:
             logger = SummaryWriter(log_dir=model_dir + "/logs")
@@ -1051,7 +1058,7 @@ class EDM_ADV_SS(EDM):
                         losses_sum[k] = 0.
                         losses_sum_count[k] = 0
 
-                if self.step % steps_valid == 0 and self.step > 0:
+                if steps_valid is not None and (self.step % steps_valid == 0 and self.step > 0):
                     with torch.no_grad():
                         if self.accelerator.is_main_process:
                             self.accelerator.print("Validation")
@@ -1443,6 +1450,6 @@ class EDM_ADV_SS(EDM):
         for i in range(self.n_stems):
             self.encoders[i].load_state_dict(encoder_weights, strict=False)
             self.encoders_time[i].load_state_dict(encoder_time_weights, strict=False)
-            if self.classifiers[i] is not None:
-                self.classifiers[i].load_state_dict(classifier_weights, strict=False)
+            self.classifiers[i].load_state_dict(classifier_weights, strict=False)
         self.net.load_weights(net_weights)
+        self.initialized = True

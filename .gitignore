@@ -10,5 +10,7 @@ pretrained/*
 code_perso
 index.md
 lmdb/
+lmdb_ss/
 slakh2100_flac_redux/
 diffusion/runs/
+autoencoder_checkpoints

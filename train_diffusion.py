@@ -193,9 +193,6 @@ def main(args):
                                                drop_last=False,
                                                collate_fn=collate_fn)
 
-    print(next(iter(train_loader))["x"].shape)
-    print(next(iter(train_loader))["x_toz"].shape)
-
     ######### SAVE CONFIG #########
     model_dir = os.path.join(args.out_path, args.name)
     os.makedirs(model_dir, exist_ok=True)

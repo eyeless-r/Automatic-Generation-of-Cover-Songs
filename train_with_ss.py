@@ -12,9 +12,6 @@ from dataset import SimpleDataset
 
 import argparse
 
-from demucs import pretrained
-from demucs.apply import apply_model
-
 parser = argparse.ArgumentParser()
 
 parser.add_argument("--name", type=str, default="test")
@@ -70,7 +67,10 @@ def main(args):
 
     ######### GET THE DATASET #########
 
-    dataset = SimpleDataset(path=args.db_path, keys=["waveform", "z"])
+    keys = ['waveform', 'z']
+    for i in range(6):
+        keys += [f'stem{i}-waveform', f'stem{i}-z']
+    dataset = SimpleDataset(path=args.db_path, keys=keys)
 
     try:
         dataset[0]["z"]
@@ -90,56 +90,36 @@ def main(args):
     x_length = gin.query_parameter("%X_LENGTH")
     z_length = x_length // ae_ratio
 
-    print("Loading Demucs model for source separation...")
-    demucs = pretrained.get_model('htdemucs')
-    demucs.to(model.accelerator.device)
-    demucs.eval()
-
     def collate_fn(L):
         x = np.stack([l["waveform"] for l in L])
         x = torch.from_numpy(x).float().reshape((x.shape[0], 1, -1))
 
-        if z_precomputed:
-                z = np.stack([l["z"] for l in L])
-                z = torch.from_numpy(z).float()
+        z = np.stack([l["z"] for l in L])
+        z = torch.from_numpy(z).float()
 
-        batch_stems = [[] for i in range(len(demucs.sources))]
-        for l in L:
-            audio = torch.from_numpy(l['waveform']).float().reshape((1, 1, -1))
-            audio.to(model.accelerator.device)
-            with torch.no_grad():
-                stems = apply_model(demucs, torch.cat([audio, audio], axis=1), device=model.accelerator.device)
-            for i in range(stems.shape[1]):
-                batch_stems[i].append(stems[0, i, 0, :])
-        
         i0 = np.random.randint(0, x.shape[-1] // ae_ratio - z_length,
                                    x.shape[0])
 
         i1 = np.random.randint(0, x.shape[-1] // ae_ratio - z_length,
                                    x.shape[0])
 
-        if z_precomputed:
-            z_diff = torch.stack(
-                [xc[..., i:i + z_length] for i, xc in zip(i0, z)])
-        else:
-            z_diff = torch.stack([
-                xc[..., i * ae_ratio:i * ae_ratio + x_length]
-                for i, xc in zip(i0, x)
-            ])
-
+        z_diff = torch.stack(
+                    [xc[..., i:i + z_length] for i, xc in zip(i0, z)])
+        
         x_diff, x_toz = [], []
+        for i in range(6):
+            stem_x = np.stack([l[f"stem{i}-waveform"] for l in L])
+            stem_x = torch.from_numpy(stem_x).float().reshape((stem_x.shape[0], 1, -1))
 
-        for i in range(len(demucs.sources)):
-            x_ = torch.stack(batch_stems[i])
-            x_ = x_.reshape((x.shape[0], 1, -1))
+            stem_z = np.stack([l[f"stem{i}-z"] for l in L])
+            stem_z = torch.from_numpy(stem_z).float()
+
             x_diff.append(torch.stack([
                 xc[..., i * ae_ratio:i * ae_ratio + x_length]
-                for i, xc in zip(i0, x_)
+                for i, xc in zip(i0, stem_x)
             ]))
-            x_toz.append(torch.stack([
-                    xc[..., i * ae_ratio:i * ae_ratio + x_length]
-                    for i, xc in zip(i1, x_)
-                ]))
+            x_toz.append(torch.stack(
+                [xc[..., i:i + z_length] for i, xc in zip(i1, stem_z)]))
 
         return {
             "x": z_diff,
@@ -160,9 +140,6 @@ def main(args):
                                                num_workers=0,
                                                drop_last=False,
                                                collate_fn=collate_fn)
-
-    # print(next(iter(train_loader))["x"].shape)
-    # print(next(iter(train_loader))["x_toz"].shape)
 
     ######### SAVE CONFIG #########
     model_dir = os.path.join(args.out_path, args.name)

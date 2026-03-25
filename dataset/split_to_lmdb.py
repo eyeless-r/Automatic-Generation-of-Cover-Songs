@@ -12,6 +12,9 @@ import pickle
 import pretty_midi
 from absl import app, flags
 
+from demucs import pretrained
+from demucs.apply import apply_model
+
 torch.set_grad_enabled(False)
 
 FLAGS = flags.FLAGS
@@ -22,6 +25,7 @@ flags.DEFINE_string(
     help=
     'Path to a directory containing audio files - use slakh main directory to use slakh',
     required=True)
+
 flags.DEFINE_string('output_path',
                     ".",
                     help='Output directory for the dataset',
@@ -30,6 +34,16 @@ flags.DEFINE_string('output_path',
 flags.DEFINE_bool('slakh',
                   False,
                   help='use slakh data processing',
+                  required=False)
+
+flags.DEFINE_bool('slakh_only_tracks',
+                  False,
+                  help='use slakh data processing, only mix.flac tracks',
+                  required=False)
+
+flags.DEFINE_bool('source_separation',
+                  False,
+                  help='use source separation',
                   required=False)
 
 flags.DEFINE_bool('normalize',
@@ -78,6 +92,10 @@ flags.DEFINE_bool('dyndb',
                   default=False,
                   help="Allow the database to grow dynamically")
 
+flags.DEFINE_string('device', 
+                    'cuda' if torch.cuda.is_available() else 'cpu',
+                    help='Device to use for embedding computation (cuda/cpu)')
+
 
 def flatten(iterator: Iterable):
     for elm in iterator:
@@ -99,7 +117,6 @@ def search_for_audios(
     audios = flatten(audios)
     audios = [str(a) for a in audios if 'MACOS' not in str(a)]
     return audios
-
 
 def normalize_signal(x: np.ndarray,
                      max_gain_db: int = 30,
@@ -154,6 +171,20 @@ def get_tracks_slakh(path):
     } for audio, inst in zip(audios, instr)]
     return audios, metadatas
 
+def get_only_tracks_slakh(path):
+    path = os.path.join(path, 'train')
+    audios = []
+    track_folders = [f for f in os.listdir(path) if os.path.isdir(os.path.join(path, f))]
+    a = 0
+    for folder in track_folders:
+        track_path = os.path.join(path,folder,  'mix.flac')
+        if os.path.exists(track_path):
+            audios.append(track_path)
+        a += 1
+        if a == 100:
+            break
+    return audios
+
 
 def get_midi(path, chunk_number):
     # MIDI
@@ -193,12 +224,21 @@ def main(dummy):
     if FLAGS.slakh == True:
         audios, metadatas = get_tracks_slakh(FLAGS.input_path)
     else:
-        audios = search_for_audios([FLAGS.input_path])
+        if FLAGS.slakh_only_tracks == True:
+            audios = get_only_tracks_slakh(FLAGS.input_path)
+        else:
+            audios = search_for_audios([FLAGS.input_path])
         audios = map(str, audios)
         audios = map(os.path.abspath, audios)
         audios = [*audios]
         metadatas = [{"path": audio} for audio in audios]
         print(len(audios), " files found")
+
+    if FLAGS.source_separation == True:
+        demucs = pretrained.get_model('htdemucs_6s')
+        demucs.to(FLAGS.device)
+        demucs.eval()
+        stem_chunks_buffer = [[] for _ in range(6)]
 
     chunks_buffer, metadatas_buffer = [], []
     midis = []
@@ -232,75 +272,155 @@ def main(dummy):
         if len(audio) % FLAGS.num_signal != 0:
             audio = audio[..., :FLAGS.num_signal *
                           (length // FLAGS.num_signal)]
+            
+        if not FLAGS.source_separation:
+            chunks = audio.reshape(-1, FLAGS.num_signal)
+            chunk_index = 0
 
-        chunks = audio.reshape(-1, FLAGS.num_signal)
-        chunk_index = 0
+            for j, chunk in enumerate(chunks):
+                if FLAGS.slakh == True:
+                    silence_test, midi = get_midi(file, j)
+                else:
+                    if FLAGS.cut_silences and np.max(abs(chunk)) < 0.05:
+                        silence_test = False
+                    else:
+                        silence_test = True
+                    midi = None
 
-        for j, chunk in enumerate(chunks):
-            if FLAGS.slakh == True:
-                silence_test, midi = get_midi(file, j)
-            else:
-                if FLAGS.cut_silences and np.max(abs(chunk)) < 0.05:
+                # don't process buffer if empty slice
+                if silence_test == False:
+                    chunk_index += 1
+                    continue
+
+                midis.append(midi)
+                chunks_buffer.append(
+                    torch.from_numpy(chunk.reshape(1, FLAGS.num_signal)))
+                metadatas_buffer.append(metadata)
+
+                if len(chunks_buffer) == FLAGS.batch_size or (
+                        j == len(chunks) - 1 and i == len(audios) - 1):
+                    if emb_model is not None:
+                        chunks_buffer_torch = (
+                            torch.stack(chunks_buffer).squeeze().to(FLAGS.device))
+                        z = emb_model.encode(
+                            chunks_buffer_torch.reshape(-1, 1, FLAGS.num_signal))
+                    else:
+                        z = [None] * len(chunks_buffer)
+
+                    for array, curz, midi, cur_metadata in zip(
+                            chunks_buffer, z, midis, metadatas_buffer):
+
+                        ae = AudioExample()
+                        assert array.shape[-1] == FLAGS.num_signal
+                        array = (array.cpu().numpy() * (2**15 - 1)).astype(
+                            np.int16)
+                        ae.put_array("waveform", array, dtype=np.int16)
+
+                        # EMBEDDING
+                        if curz is not None:
+                            ae.put_array("z", curz.cpu().numpy(), dtype=np.float32)
+
+                        # METADATA
+                        cur_metadata["chunk_index"] = chunk_index
+                        ae.put_metadata(cur_metadata)
+
+                        # MIDI DATA
+                        if midi is not None:
+
+                            pr = midi.get_piano_roll(times=np.linspace(
+                                0, FLAGS.num_signal /
+                                FLAGS.sample_rate, FLAGS.num_signal //
+                                FLAGS.ae_ratio))
+
+                            ae.put_array("pr", pr, dtype=np.float32)
+
+                        key = f"{cur_index:08d}"
+
+                        with env.begin(write=True) as txn:
+                            txn.put(key.encode(), bytes(ae))
+                        cur_index += 1
+
+                    chunks_buffer, midis, metadatas_buffer = [], [], []
+                chunk_index += 1
+        else:
+            audio = torch.from_numpy(audio.reshape(1, 1, -1)).to(FLAGS.device)
+            stems = apply_model(demucs, torch.cat([audio, audio], axis=1), device=FLAGS.device)
+
+            chunks = audio.reshape(-1, FLAGS.num_signal)
+            chunk_index = 0
+
+            for j, chunk in enumerate(chunks):
+                if FLAGS.cut_silences and torch.max(abs(chunk)) < 0.05:
                     silence_test = False
                 else:
                     silence_test = True
-                midi = None
 
-            # don't process buffer if empty slice
-            if silence_test == False:
+                # don't process buffer if empty slice
+                if silence_test == False:
+                    chunk_index += 1
+                    continue
+
+                chunks_buffer.append(chunk.reshape(1, FLAGS.num_signal))
+                metadatas_buffer.append(metadata)
+                for i in range(6):
+                    stem_chunk = stems[0, i, 0, j * FLAGS.num_signal: (j + 1) * FLAGS.num_signal]
+                    stem_chunks_buffer[i].append(stem_chunk.reshape(1, FLAGS.num_signal))
+
+                if len(chunks_buffer) == FLAGS.batch_size or (
+                        j == len(chunks) - 1 and i == len(audios) - 1):
+                    if emb_model is not None:
+                        chunks_buffer_torch = (
+                            torch.stack(chunks_buffer).squeeze().to(FLAGS.device))
+                        z = emb_model.encode(
+                            chunks_buffer_torch.reshape(-1, 1, FLAGS.num_signal))
+                        stems_z = []
+                        for i in range(6):
+                            stem_chunk_buffer_torch = torch.stack(stem_chunks_buffer[i]).squeeze().to(FLAGS.device)
+                            stems_z.append(emb_model.encode(stem_chunk_buffer_torch.reshape(-1, 1, FLAGS.num_signal)))
+                    else:
+                        z = [None] * len(chunks_buffer)
+                        stems_z = []
+                        for i in range(6):
+                            stems_z.append([None] * len(chunks_buffer))
+
+                    for i, array in enumerate(chunks_buffer):
+                        curz = z[i]
+                        cur_metadata = metadatas_buffer[i]
+
+                        ae = AudioExample()
+                        assert array.shape[-1] == FLAGS.num_signal
+                        array = (array.cpu().numpy() * (2**15 - 1)).astype(
+                            np.int16)
+                        ae.put_array("waveform", array, dtype=np.int16)
+
+                        # EMBEDDING
+                        if curz is not None:
+                            ae.put_array("z", curz.cpu().numpy(), dtype=np.float32)
+
+                        for j in range(6):
+                            stem_array = stem_chunks_buffer[j][i]
+                            stem_array = (stem_array.cpu().numpy() * (2**15 - 1)).astype(np.int16)
+                            ae.put_array(f"stem{j}-waveform", stem_array, dtype=np.int16)
+
+                            stem_curz = stems_z[j][i]
+                            if stem_curz is not None:
+                                ae.put_array(f"stem{j}-z", stem_curz.cpu().numpy(), dtype=np.float32)
+
+                        # METADATA
+                        cur_metadata["chunk_index"] = chunk_index
+                        ae.put_metadata(cur_metadata)
+
+
+                        key = f"{cur_index:08d}"
+
+                        with env.begin(write=True) as txn:
+                            txn.put(key.encode(), bytes(ae))
+                        cur_index += 1
+
+                    chunks_buffer, midis, metadatas_buffer = [], [], []
+                    stem_chunks_buffer = [[] for _ in range(6)]
                 chunk_index += 1
-                continue
 
-            midis.append(midi)
-            chunks_buffer.append(
-                torch.from_numpy(chunk.reshape(1, FLAGS.num_signal)))
-            metadatas_buffer.append(metadata)
-
-            if len(chunks_buffer) == FLAGS.batch_size or (
-                    j == len(chunks) - 1 and i == len(audios) - 1):
-                if emb_model is not None:
-                    chunks_buffer_torch = (
-                        torch.stack(chunks_buffer).squeeze().to(FLAGS.device))
-                    z = emb_model.encode(
-                        chunks_buffer_torch.reshape(-1, 1, FLAGS.num_signal))
-                else:
-                    z = [None] * len(chunks_buffer)
-
-                for array, curz, midi, cur_metadata in zip(
-                        chunks_buffer, z, midis, metadatas_buffer):
-
-                    ae = AudioExample()
-                    assert array.shape[-1] == FLAGS.num_signal
-                    array = (array.cpu().numpy() * (2**15 - 1)).astype(
-                        np.int16)
-                    ae.put_array("waveform", array, dtype=np.int16)
-
-                    # EMBEDDING
-                    if curz is not None:
-                        ae.put_array("z", curz.cpu().numpy(), dtype=np.float32)
-
-                    # METADATA
-                    cur_metadata["chunk_index"] = chunk_index
-                    ae.put_metadata(cur_metadata)
-
-                    # MIDI DATA
-                    if midi is not None:
-
-                        pr = midi.get_piano_roll(times=np.linspace(
-                            0, FLAGS.num_signal /
-                            FLAGS.sample_rate, FLAGS.num_signal //
-                            FLAGS.ae_ratio))
-
-                        ae.put_array("pr", pr, dtype=np.float32)
-
-                    key = f"{cur_index:08d}"
-
-                    with env.begin(write=True) as txn:
-                        txn.put(key.encode(), bytes(ae))
-                    cur_index += 1
-
-                chunks_buffer, midis, metadatas_buffer = [], [], []
-            chunk_index += 1
     env.close()
 
 
