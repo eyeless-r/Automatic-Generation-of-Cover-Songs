@@ -26,6 +26,8 @@ parser.add_argument("--db_path", type=str, default=None)
 parser.add_argument("--out_path", type=str, default="./diffusion/runs")
 parser.add_argument("--emb_model_path", type=str)
 
+parser.add_argument("--use_full_audio", type=int, default=0)
+
 
 def add_gin_extension(config_name: str) -> str:
     if config_name[-4:] != '.gin':
@@ -44,7 +46,7 @@ def main(args):
     )
 
     if args.restart > 0:
-        config_path = "./diffusion/runs/" + args.name + "/config.gin"
+        config_path = "./diffusion/runs/" + args.name + "/config_ss.gin"
         with gin.unlock_config():
             gin.parse_config_files_and_bindings([config_path], [])
 
@@ -107,6 +109,13 @@ def main(args):
                     [xc[..., i:i + z_length] for i, xc in zip(i0, z)])
         
         x_diff, x_toz = [], []
+        if args.use_full_audio != 0:
+            x_diff.append(torch.stack([
+                xc[..., i * ae_ratio:i * ae_ratio + x_length]
+                for i, xc in zip(i0, x)
+            ]))
+            x_toz.append(torch.stack(
+                [xc[..., i:i + z_length] for i, xc in zip(i1, z)]))
         for i in range(6):
             stem_x = np.stack([l[f"stem{i}-waveform"] for l in L])
             stem_x = torch.from_numpy(stem_x).float().reshape((stem_x.shape[0], 1, -1))

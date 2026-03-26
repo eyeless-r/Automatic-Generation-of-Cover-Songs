@@ -28,7 +28,7 @@ class ConvBlock1D(nn.Module):
                                kernel_size=kernel_size,
                                padding="same")
         else:
-            self.conv1 = nn.Conv1d(in_c + time_cond_channels * 6,
+            self.conv1 = nn.Conv1d(in_c + time_cond_channels * n_stems,
                                out_c,
                                kernel_size=kernel_size,
                                padding="same")
@@ -574,4 +574,3 @@ class UNET1D(nn.Module):
         else:
             for i in range(self.n_stems):
                 self.cond_emb_time[i].load_state_dict(cond_emb_time_weights)
-

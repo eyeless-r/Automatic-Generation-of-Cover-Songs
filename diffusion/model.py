@@ -851,7 +851,7 @@ class EDM_ADV_SS(EDM):
         reg_classifier: float,
         warmup_classifier: int,
         warmup_timbre: int,
-        n_stems: int = 4,
+        n_stems: int = 6,
         sigma_min: float = 0.002,
         sigma_max: float = 80.,
         p_mean: float = -1.2,
