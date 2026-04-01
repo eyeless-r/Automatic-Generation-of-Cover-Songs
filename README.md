@@ -1,6 +1,6 @@
 # Automatic Generation of Cover Songs Using Deep Learning
 
-You can listen to examples [here]()
+You can listen to examples [here](https://eyeless-r.github.io/Automatic-Generation-of-Cover-Songs/)
 
 ## Model training
 
