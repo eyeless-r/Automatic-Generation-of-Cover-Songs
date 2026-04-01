@@ -1453,3 +1453,30 @@ class EDM_ADV_SS(EDM):
             self.classifiers[i].load_state_dict(classifier_weights, strict=False)
         self.net.load_weights(net_weights)
         self.initialized = True
+
+    def partial_load_weights(self, model_dir, restart_step):
+        checkpoint_path = f"{model_dir}/checkpoint{restart_step}.pt"
+        state_dict = torch.load(checkpoint_path, map_location="cpu")["model_state"]
+        encoder_weights = {}
+        encoder_time_weights = {}
+        classifier_weights = {}
+        net_weights = {}
+        for key, value in state_dict.items():
+            if key.startswith('encoder.'):
+                new_key = key.replace('encoder.', '', 1)
+                encoder_weights[new_key] = value
+            elif key.startswith('encoder_time.'):
+                new_key = key.replace('encoder_time.', '', 1)
+                encoder_time_weights[new_key] = value
+            elif key.startswith('classifier.'):
+                new_key = key.replace('classifier.', '', 1)
+                classifier_weights[new_key] = value  
+            elif key.startswith('net.'):
+                new_key = key.replace('net.', '', 1)
+                net_weights[new_key] = value
+        self.encoders[0].load_state_dict(encoder_weights, strict=False)
+        self.encoders_time[0].load_state_dict(encoder_time_weights, strict=False)
+        for i in range(self.n_stems):
+            self.classifiers[i].load_state_dict(classifier_weights, strict=False)
+        self.net.load_weights(net_weights)
+        self.initialized = True

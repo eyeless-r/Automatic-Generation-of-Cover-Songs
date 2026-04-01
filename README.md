@@ -1,5 +1,7 @@
 # Automatic Generation of Cover Songs Using Deep Learning
 
+You can listen to examples [here]()
+
 ## Model training
 
 Prior to training, install the required dependancies using :

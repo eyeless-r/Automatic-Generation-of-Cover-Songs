@@ -182,6 +182,7 @@ def main(args):
         print("Number of parameters - encoders_time : ", num_el / 1e6, "M")
 
     model.load_weights(model_dir=model_dir, restart_step=args.restart)
+    # model.partial_load_weights(model_dir = model_dir, restart_step=args.restart)
 
     ######### TRAINING #########
     d = {

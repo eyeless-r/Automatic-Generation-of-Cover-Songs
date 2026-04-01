@@ -36,8 +36,8 @@ flags.DEFINE_bool('slakh',
                   help='use slakh data processing',
                   required=False)
 
-flags.DEFINE_bool('slakh_only_tracks',
-                  False,
+flags.DEFINE_string('slakh_only_tracks',
+                  None,
                   help='use slakh data processing, only mix.flac tracks',
                   required=False)
 
@@ -171,8 +171,8 @@ def get_tracks_slakh(path):
     } for audio, inst in zip(audios, instr)]
     return audios, metadatas
 
-def get_only_tracks_slakh(path):
-    path = os.path.join(path, 'train')
+def get_only_tracks_slakh(path, slakh_only_tracks):
+    path = os.path.join(path, slakh_only_tracks)
     audios = []
     track_folders = [f for f in os.listdir(path) if os.path.isdir(os.path.join(path, f))]
     a = 0
@@ -224,10 +224,10 @@ def main(dummy):
     if FLAGS.slakh == True:
         audios, metadatas = get_tracks_slakh(FLAGS.input_path)
     else:
-        if FLAGS.slakh_only_tracks == True:
-            audios = get_only_tracks_slakh(FLAGS.input_path)
-        else:
+        if FLAGS.slakh_only_tracks is None:
             audios = search_for_audios([FLAGS.input_path])
+        else:
+            audios = get_only_tracks_slakh(FLAGS.input_path, FLAGS.slakh_only_tracks)
         audios = map(str, audios)
         audios = map(os.path.abspath, audios)
         audios = [*audios]
