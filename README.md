@@ -22,7 +22,7 @@ Source separation experiments in this repository also rely on [`Demucs`](https:/
 
 ### Advanced mode
 
-TODO
+![Base mode diagram](paper/diagram2.jpg)
 
 ## Model training
 
