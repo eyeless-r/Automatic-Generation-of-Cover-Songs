@@ -1,10 +1,32 @@
 # Automatic Generation of Cover Songs Using Deep Learning
 
+## About the Repository
+
+This repository contains the code, experiments, and demo materials for the coursework project on automatic cover song generation in the audio domain. The project treats cover generation as a music style transfer problem: given an existing track, the goal is to generate a new stylistic version while preserving recognizable musical content.
+
+The core approach is based on a latent diffusion model that disentangles musical structure and style and recombines them in a conditional denoising U-Net. A special focus of this repository is multi-instrument music: in addition to the base pipeline, it includes experiments with source separation, where an input mixture is first decomposed into instrumental stems and then used to condition the diffusion model. The repository includes dataset preprocessing scripts, training pipelines, notebooks for inference, and demo examples.
+
 You can listen to examples [here](https://eyeless-r.github.io/Automatic-Generation-of-Cover-Songs/)
+
+## Credits
+
+This project builds on the original [`control-transfer-diffusion`](https://github.com/NilsDem/control-transfer-diffusion) repository by NilsDem. The current repository adapts and extends that codebase for cover song generation and for experiments with source separation in complex musical mixtures.
+
+Source separation experiments in this repository also rely on [`Demucs`](https://github.com/facebookresearch/demucs), developed by facebookresearch. It is used here as the backbone model for separating input mixtures into instrumental stems before conditioning the diffusion pipeline.
+
+## Architecture
+
+### Base mode
+
+![Base mode diagram](paper/diagram.jpg)
+
+### Advanced mode
+
+TODO
 
 ## Model training
 
-Prior to training, install the required dependancies using :
+Prior to training, install the required dependencies using :
 
 ```bash
 pip install -r "requirements.txt"
