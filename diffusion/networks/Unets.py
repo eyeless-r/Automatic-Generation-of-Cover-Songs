@@ -10,6 +10,8 @@ from .Encoders import Encoder1D
 @gin.configurable
 class ConvBlock1D(nn.Module):
 
+    VALID_MULTI_STEM_MODES = {"base", "advanced"}
+
     def __init__(self,
                  in_c,
                  out_c,
@@ -18,9 +20,14 @@ class ConvBlock1D(nn.Module):
                  cond_channels,
                  kernel_size,
                  n_stems=1,
+                 multi_stem_mode="advanced",
                  act=nn.SiLU,
                  res=True):
         super().__init__()
+        if multi_stem_mode not in self.VALID_MULTI_STEM_MODES:
+            raise ValueError(
+                f"Unsupported multi_stem_mode={multi_stem_mode!r}. "
+                f"Expected one of {sorted(self.VALID_MULTI_STEM_MODES)}.")
         self.res = res
         if n_stems == 1:
             self.conv1 = nn.Conv1d(in_c + time_cond_channels,
@@ -43,14 +50,23 @@ class ConvBlock1D(nn.Module):
         self.time_mlp = nn.Sequential(nn.Linear(time_channels, 128), act(),
                                       nn.Linear(128, 2 * out_c))
         self.n_stems = n_stems
-        if n_stems == 1:
-            self.cond_mlp = nn.Sequential(nn.Linear(cond_channels, 128), act(),
-                                      nn.Linear(128, 2 * out_c))
-        else:
+        self.multi_stem_mode = multi_stem_mode
+        self.use_base_multi_stem = n_stems > 1 and multi_stem_mode == "base"
+        self.use_advanced_multi_stem = n_stems > 1 and multi_stem_mode == "advanced"
+        if self.use_base_multi_stem:
             self.cond_mlp = nn.ModuleList()
             for _ in range(n_stems):
-                self.cond_mlp.append(nn.Sequential(nn.Linear(cond_channels, 128), act(),
-                                      nn.Linear(128, 2 * out_c)))
+                self.cond_mlp.append(
+                    nn.Sequential(nn.Linear(cond_channels, 128), act(),
+                                  nn.Linear(128, 2 * out_c)))
+        else:
+            self.cond_mlp = nn.Sequential(nn.Linear(cond_channels, 128), act(),
+                                          nn.Linear(128, 2 * out_c))
+        if self.use_advanced_multi_stem:
+            self.zsem_norm = nn.LayerNorm(cond_channels)
+            self.zsem_gate = nn.Linear(cond_channels, 1)
+            nn.init.zeros_(self.zsem_gate.weight)
+            nn.init.zeros_(self.zsem_gate.bias)
 
         if in_c != out_c:
             self.to_out = nn.Conv1d(in_c // 2,
@@ -70,9 +86,18 @@ class ConvBlock1D(nn.Module):
         if time_cond is not None:
             if self.n_stems == 1:
                 x = torch.cat([x, time_cond], axis=1)
+            elif self.use_base_multi_stem:
+                x = torch.cat([x, *time_cond], axis=1)
             else:
-                for tc in time_cond:
-                    x = torch.cat([x, tc], axis=1)
+                x = torch.cat([x, time_cond[0]], axis=1)
+                missing_channels = self.conv1.in_channels - x.shape[1]
+                if missing_channels > 0:
+                    zeros = torch.zeros(x.shape[0],
+                                        missing_channels,
+                                        x.shape[-1],
+                                        device=x.device,
+                                        dtype=x.dtype)
+                    x = torch.cat([x, zeros], axis=1)
 
         x = self.conv1(x)
         x = self.gn1(x)
@@ -86,13 +111,21 @@ class ConvBlock1D(nn.Module):
             zsem = self.cond_mlp(zsem)
             zsem_mult, zsem_add = torch.split(zsem, zsem.shape[-1] // 2, -1)
             x = x * zsem_mult[:, :, None] + zsem_add[:, :, None]
-        else:
+        elif self.use_base_multi_stem:
             x_list = []
             for i in range(self.n_stems):
                 zsem_ = self.cond_mlp[i](zsem[i])
                 zsem_mult, zsem_add = torch.split(zsem_, zsem_.shape[-1] // 2, -1)
                 x_list.append(x * zsem_mult[:, :, None] + zsem_add[:, :, None])
             x = torch.stack(x_list).mean(axis=0)
+        else:
+            zsem = torch.stack(zsem, dim=1)
+            zsem = self.zsem_norm(zsem)
+            zsem_w = torch.softmax(self.zsem_gate(zsem).squeeze(-1), dim=1)
+            zsem = (zsem * zsem_w[:, :, None]).sum(dim=1)
+            zsem = self.cond_mlp(zsem)
+            zsem_mult, zsem_add = torch.split(zsem, zsem.shape[-1] // 2, -1)
+            x = x * zsem_mult[:, :, None] + zsem_add[:, :, None]
 
         x = self.act(x)
         x = self.conv2(x)
@@ -106,18 +139,16 @@ class ConvBlock1D(nn.Module):
         return x
 
     def load_weights(self, state_dict):
-        conv1_weights = {}
         gn1_weights = {}
         conv2_weights = {}
         gn2_weights = {}
         time_mlp_weights = {}
         cond_mlp_weights = {}
+        zsem_norm_weights = {}
+        zsem_gate_weights = {}
         to_out_weights = {}
         for key, value in state_dict.items():
-            if key.startswith('conv1.'):
-                new_key = key.replace('conv1.', '', 1)
-                conv1_weights[new_key] = value
-            elif key.startswith('gn1.'):
+            if key.startswith('gn1.'):
                 new_key = key.replace('gn1.', '', 1)
                 gn1_weights[new_key] = value
             elif key.startswith('conv2.'):
@@ -132,21 +163,47 @@ class ConvBlock1D(nn.Module):
             elif key.startswith('cond_mlp.'):
                 new_key = key.replace('cond_mlp.', '', 1)
                 cond_mlp_weights[new_key] = value
+            elif key.startswith('zsem_norm.'):
+                new_key = key.replace('zsem_norm.', '', 1)
+                zsem_norm_weights[new_key] = value
+            elif key.startswith('zsem_gate.'):
+                new_key = key.replace('zsem_gate.', '', 1)
+                zsem_gate_weights[new_key] = value
             elif key.startswith('to_out.'):
                 new_key = key.replace('to_out.', '', 1)
                 to_out_weights[new_key] = value
-        if self.n_stems == 1:
-            self.conv1.load_state_dict(conv1_weights)
         self.gn1.load_state_dict(gn1_weights)
         self.conv2.load_state_dict(conv2_weights)
         self.gn2.load_state_dict(gn2_weights)
         self.time_mlp.load_state_dict(time_mlp_weights)
         self.to_out.load_state_dict(to_out_weights)
-        if self.n_stems == 1:
-            self.cond_mlp.load_state_dict(cond_mlp_weights)
-        else:
-            for i in range(self.n_stems):
-                self.cond_mlp[i].load_state_dict(cond_mlp_weights)
+        if cond_mlp_weights:
+            sample_key = next(iter(cond_mlp_weights))
+            if self.use_base_multi_stem:
+                if sample_key.count('.') >= 2:
+                    for i in range(self.n_stems):
+                        stem_weights = {
+                            key.split('.', 1)[1]: value
+                            for key, value in cond_mlp_weights.items()
+                            if key.startswith(f'{i}.')
+                        }
+                        if stem_weights:
+                            self.cond_mlp[i].load_state_dict(stem_weights)
+                else:
+                    for i in range(self.n_stems):
+                        self.cond_mlp[i].load_state_dict(cond_mlp_weights)
+            else:
+                if sample_key.count('.') >= 2:
+                    cond_mlp_weights = {
+                        key.split('.', 1)[1]: value
+                        for key, value in cond_mlp_weights.items()
+                        if key.startswith('0.')
+                    }
+                self.cond_mlp.load_state_dict(cond_mlp_weights)
+        if self.use_advanced_multi_stem and zsem_norm_weights:
+            self.zsem_norm.load_state_dict(zsem_norm_weights)
+        if self.use_advanced_multi_stem and zsem_gate_weights:
+            self.zsem_gate.load_state_dict(zsem_gate_weights)
 
 
 @gin.configurable

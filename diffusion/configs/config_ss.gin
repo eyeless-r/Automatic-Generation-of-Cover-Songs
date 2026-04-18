@@ -1,0 +1,158 @@
+from __gin__ import dynamic_registration
+from diffusion import model
+from diffusion import networks
+from diffusion.networks import Encoders
+from diffusion.networks import Unets
+from diffusion import utils
+import diffusion.utils.transforms
+
+# Macros:
+# ==============================================================================
+ADV_WEIGHT = 0.1
+AE_EMBSIZE = 32
+GUIDANCE_DROP = 0.2
+LR = 0.00001
+N_MELS = 256
+SR = 24000
+WARMUP_STRUCTURE = 150000
+WARMUP_TIMBRE = 100000
+X_LENGTH = 131072
+ZS_CHANNELS = 32
+ZT_CHANNELS = 32
+N_STEMS = 7
+
+# Parameters for model.Base:
+# ==============================================================================
+model.Base.emb_model = None
+
+# Parameters for Unets.ConvBlock1D:
+# ==============================================================================
+Unets.ConvBlock1D.res = True
+Unets.ConvBlock1D.multi_stem_mode = 'advanced'
+
+# Parameters for Unets.DecoderBlock1D:
+# ==============================================================================
+Unets.DecoderBlock1D.skip_size = None
+Unets.DecoderBlock1D.use_self_attn = False
+
+
+# Parameters for model.EDM_ADV_SS:
+# ==============================================================================
+model.EDM_ADV_SS.n_stems = %N_STEMS
+model.EDM_ADV_SS.classifier = @classifier/Encoders.Encoder1D()
+model.EDM_ADV_SS.data_prep = 'normal'
+model.EDM_ADV_SS.data_type = 'audio'
+model.EDM_ADV_SS.drop_values = [-4.0, -4.0]
+model.EDM_ADV_SS.encoder = @encoder_timbre/Encoders.Encoder1D()
+model.EDM_ADV_SS.encoder_time = @encoder_structure/Encoders.Encoder1D()
+model.EDM_ADV_SS.net = @Unets.UNET1D()
+model.EDM_ADV_SS.p_mean = -1.2
+model.EDM_ADV_SS.p_std = 1.2
+model.EDM_ADV_SS.reg_classifier = %ADV_WEIGHT
+model.EDM_ADV_SS.rho = 7
+model.EDM_ADV_SS.sdata = 0.65
+model.EDM_ADV_SS.sigma_max = 80.0
+model.EDM_ADV_SS.sigma_min = 0.002
+model.EDM_ADV_SS.sr = %SR
+model.EDM_ADV_SS.time_transform = @diffusion.utils.transforms.PytorchCQT()
+model.EDM_ADV_SS.warmup_classifier = %WARMUP_STRUCTURE
+model.EDM_ADV_SS.warmup_timbre = %WARMUP_TIMBRE
+
+# Parameters for encoder_structure/Encoders.Encoder1D:
+# ==============================================================================
+encoder_structure/Encoders.Encoder1D.average_out = False
+encoder_structure/Encoders.Encoder1D.channels = [256, 256, 256, 512, %ZS_CHANNELS]
+encoder_structure/Encoders.Encoder1D.in_size = %N_MELS
+encoder_structure/Encoders.Encoder1D.kernel_size = 3
+encoder_structure/Encoders.Encoder1D.ratios = [1, 1, 1, 1, 1, 1]
+encoder_structure/Encoders.Encoder1D.use_tanh = True
+
+# Parameters for encoder_timbre/Encoders.Encoder1D:
+# ==============================================================================
+encoder_timbre/Encoders.Encoder1D.average_out = True
+encoder_timbre/Encoders.Encoder1D.channels = [128, 256, 256, 512, %ZT_CHANNELS]
+encoder_timbre/Encoders.Encoder1D.in_size = %AE_EMBSIZE
+encoder_timbre/Encoders.Encoder1D.kernel_size = 3
+encoder_timbre/Encoders.Encoder1D.ratios = [1, 2, 2, 2, 2, 2]
+encoder_timbre/Encoders.Encoder1D.use_tanh = True
+
+# Parameters for classifier/Encoders.Encoder1D:
+# ==============================================================================
+classifier/Encoders.Encoder1D.average_out = True
+classifier/Encoders.Encoder1D.channels = [32, 64, 128, 128, %ZT_CHANNELS]
+classifier/Encoders.Encoder1D.in_size = %ZS_CHANNELS
+classifier/Encoders.Encoder1D.kernel_size = 3
+classifier/Encoders.Encoder1D.ratios = [1, 2, 2, 2, 2, 2]
+classifier/Encoders.Encoder1D.use_tanh = True
+
+# Parameters for Unets.EncoderBlock1D:
+# ==============================================================================
+Unets.EncoderBlock1D.use_self_attn = False
+
+# Parameters for model.EDM_ADV_SS.fit_ss:
+# ==============================================================================
+model.EDM_ADV_SS.fit_ss.guidance = %GUIDANCE_DROP
+model.EDM_ADV_SS.fit_ss.max_steps = 180000
+model.EDM_ADV_SS.fit_ss.steps_display = 100
+model.EDM_ADV_SS.fit_ss.steps_save = 5000
+model.EDM_ADV_SS.fit_ss.steps_valid = None
+model.EDM_ADV_SS.fit_ss.train_encoder = True
+model.EDM_ADV_SS.fit_ss.train_encoder_time = True
+model.EDM_ADV_SS.fit_ss.use_context = True
+model.EDM_ADV_SS.fit_ss.use_ema = True
+
+# Parameters for model.Base.get_scheduler:
+# ==============================================================================
+model.Base.get_scheduler.decay_max = 0.1
+model.Base.get_scheduler.decay_steps = 500000
+model.Base.get_scheduler.scheduler_type = 'linear'
+model.Base.get_scheduler.warmup_steps = 500000
+
+# Parameters for model.Base.init_train:
+# ==============================================================================
+model.Base.init_train.lr = %LR
+
+# Parameters for model.EDM_ADV_SS.init_train_ss:
+# ==============================================================================
+model.EDM_ADV_SS.init_train_ss.lr = %LR
+
+# Parameters for Unets.MiddleBlock1D:
+# ==============================================================================
+Unets.MiddleBlock1D.ratio = 2
+
+# Parameters for diffusion.utils.transforms.PytorchCQT:
+# ==============================================================================
+diffusion.utils.transforms.PytorchCQT.block_length = %X_LENGTH
+diffusion.utils.transforms.PytorchCQT.num_bins_per_octave = 32
+diffusion.utils.transforms.PytorchCQT.num_octaves = 8
+diffusion.utils.transforms.PytorchCQT.sr = %SR
+
+# Parameters for Unets.UNET1D:
+# ==============================================================================
+Unets.UNET1D.n_stems = %N_STEMS
+Unets.UNET1D.channels = [256, 512, 512, 1024]
+Unets.UNET1D.cond = {}
+Unets.UNET1D.in_size = %AE_EMBSIZE
+Unets.UNET1D.kernel_size = 5
+Unets.UNET1D.n_attn_layers = 2
+Unets.UNET1D.ratios = [1, 2, 2, 2, 2]
+Unets.UNET1D.time_channels = 128
+Unets.UNET1D.time_cond_channels = 128
+Unets.UNET1D.time_cond_in_channels = %ZS_CHANNELS
+Unets.UNET1D.z_channels = %ZT_CHANNELS
+
+# Parameters for encoder_structure/Encoders.V2ConvBlock1D:
+# ==============================================================================
+encoder_structure/Encoders.V2ConvBlock1D.res = True
+
+# Parameters for encoder_timbre/Encoders.V2ConvBlock1D:
+# ==============================================================================
+encoder_timbre/Encoders.V2ConvBlock1D.res = True
+
+# Parameters for encoder_structure/Encoders.V2EncoderBlock1D:
+# ==============================================================================
+# None.
+
+# Parameters for encoder_timbre/Encoders.V2EncoderBlock1D:
+# ==============================================================================
+# None.
